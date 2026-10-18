@@ -31,10 +31,10 @@ def log_trade(symbol, side, amount, price, cost, pnl=0.0, balance_usdt=0.0):
         symbol,
         side,
         f"{amount:.8f}",
-        f"{price:,.2f}",
-        f"{cost:,.2f}",
-        f"{pnl:,.2f}",
-        f"{balance_usdt:,.2f}",
+        f"{price:.2f}",
+        f"{cost:.2f}",
+        f"{pnl:.2f}",
+        f"{balance_usdt:.2f}",
     ]
     with open(LOG_FILE, "a", newline="") as f:
         writer = csv.writer(f)
@@ -56,7 +56,8 @@ def get_performance():
     if not trades:
         return {"total_trades": 0, "total_pnl": 0.0, "win_rate": 0.0}
 
-    pnls = [float(t["pnl"]) for t in trades]
+    # Tolerate older logs written with thousands separators.
+    pnls = [float(str(t["pnl"]).replace(",", "")) for t in trades]
     wins = [p for p in pnls if p > 0]
     return {
         "total_trades": len(pnls),
