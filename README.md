@@ -44,6 +44,15 @@ python bot.py
 python backtest.py
 ```
 
+### 5. Run the tests
+
+Offline tests for the strategy, backtest and trade-log modules. No API keys or
+exchange connection needed; only `pandas` and `numpy` from requirements.txt.
+
+```bash
+python -m unittest discover -s tests
+```
+
 ## Configuration
 
 Edit `config.py` to customize:
@@ -80,6 +89,7 @@ trading-bot/
 ├── backtest.py      # Backtesting engine
 ├── logger.py        # Trade logging to CSV
 ├── requirements.txt # Python dependencies
+├── tests/           # Offline unit tests
 └── README.md
 ```
 
