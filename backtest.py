@@ -13,6 +13,7 @@ from config import (
     RSI_OVERSOLD,
     STOP_LOSS_PCT,
     TAKE_PROFIT_PCT,
+    POSITION_SIZE,
 )
 from strategy import add_indicators, get_signal
 
@@ -34,6 +35,7 @@ def backtest(
     rsi_os=RSI_OVERSOLD,
     stop_loss=STOP_LOSS_PCT,
     take_profit=TAKE_PROFIT_PCT,
+    position_size=POSITION_SIZE,
 ):
     df = add_indicators(df, sma_short, sma_long, RSI_PERIOD)
     if len(df) < sma_long + 10:
@@ -45,6 +47,13 @@ def backtest(
     capital = 1000.0
     balance = capital
     peak_balance = capital
+    max_dd = 0.0
+
+    def track_drawdown():
+        nonlocal peak_balance, max_dd
+        peak_balance = max(peak_balance, balance)
+        if peak_balance > 0:
+            max_dd = max(max_dd, (peak_balance - balance) / peak_balance * 100)
 
     for i in range(1, len(df)):
         curr = df.iloc[i]
@@ -77,11 +86,12 @@ def backtest(
                     }
                 )
                 position = None
+                track_drawdown()
                 continue
 
         # Signal logic
         if position is None and sma_cross_up and curr["rsi"] < rsi_ob:
-            position = {"entry": curr["close"], "cost": balance * 0.10}
+            position = {"entry": curr["close"], "cost": balance * position_size}
         elif position is not None and (sma_cross_down or curr["rsi"] > rsi_ob):
             change = (curr["close"] - position["entry"]) / position["entry"]
             pnl = change * position["cost"]
@@ -97,7 +107,7 @@ def backtest(
             )
             position = None
 
-        peak_balance = max(peak_balance, balance)
+        track_drawdown()
 
     # Close any open position at last price
     if position:
@@ -119,16 +129,21 @@ def backtest(
         logger.info("No trades generated during backtest period.")
         return {
             "trades": 0,
-            "pnl": 0,
-            "return_pct": 0,
-            "win_rate": 0,
-            "max_drawdown": 0,
-        }
+            "total_pnl": 0.0,
+            "return_pct": 0.0,
+            "win_rate": 0.0,
+            "avg_pnl": 0.0,
+            "max_drawdown_pct": 0.0,
+            "final_balance": capital,
+            "losing_trades": 0,
+            "winning_trades": 0,
+            "best_trade": 0.0,
+            "worst_trade": 0.0,
+        }, []
 
     pnls = [t["pnl"] for t in trades]
     wins = [p for p in pnls if p > 0]
     total_pnl = sum(pnls)
-    max_dd = (peak_balance - balance) / peak_balance * 100 if peak_balance > 0 else 0
 
     results = {
         "trades": len(trades),
