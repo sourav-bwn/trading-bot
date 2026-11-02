@@ -1,4 +1,5 @@
 import logging
+import math
 import signal
 import sys
 import time
@@ -16,7 +17,7 @@ from config import (
 )
 from exchange import Exchange
 from strategy import get_signal
-from logger import log_trade, get_performance, init_log
+from logger import log_trade, get_performance, init_log, get_trades
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL),
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 running = True
 position = None  # {"entry_price": float, "amount": float, "side": "buy"}
+untracked_holdings = False  # real balance that cannot be reconciled with the trade log; blocks new buys
 
 
 def shutdown(signum, frame):
@@ -60,6 +62,13 @@ def check_stop_loss_take_profit(price):
 
 def execute_buy(exchange):
     global position
+    if untracked_holdings:
+        logger.warning(
+            "BUY blocked: exchange holdings found after restart that are not in the "
+            "trade log. Reconcile them (sell manually or add the missing BUY row) "
+            "before buying on top of them."
+        )
+        return
     if position is not None:
         logger.info("Already in position. Skipping BUY.")
         return
@@ -126,6 +135,93 @@ def print_status(exchange, signal_name, info):
     )
 
 
+def restore_position(exchange, symbol=SYMBOL):
+    """Restore state after a restart from the persisted trade log.
+
+    Entry price and amount come from the logged fill prices of executed
+    orders, never from the current market price: a guessed entry would
+    silently move the stop-loss/take-profit anchor. In DRY_RUN the paper
+    position exists only in the log, so the log alone is authoritative and
+    the exchange balance is not consulted. In live mode the amount is
+    clamped to the actual exchange balance. Holdings that cannot be
+    attributed to a logged open BUY are left untraded and block new buys
+    until reconciled.
+    """
+    global position, untracked_holdings
+    untracked_holdings = False
+    base = symbol.split("/")[0]
+    open_entry = None
+    open_amount = 0.0
+    invalid_open = False
+    for row in get_trades():
+        side = str(row.get("side", "")).upper()
+        try:
+            amount = float(str(row["amount"]).replace(",", ""))
+            price = float(str(row["price"]).replace(",", ""))
+        except (KeyError, ValueError):
+            price = None
+            amount = None
+        if side == "BUY":
+            # Never restore an invented or invalid cost basis.
+            if (
+                price is None
+                or amount is None
+                or not math.isfinite(price)
+                or not math.isfinite(amount)
+                or price <= 0
+                or amount <= 0
+            ):
+                invalid_open = True
+                open_entry = None
+                open_amount = 0.0
+            else:
+                invalid_open = False
+                open_entry = price
+                open_amount = amount
+        elif side == "SELL" and open_entry is not None and amount is not None:
+            open_amount -= amount
+            if open_amount <= 1e-12:
+                open_entry = None
+                open_amount = 0.0
+
+    if (open_entry is None or open_amount <= 0) and invalid_open:
+        logger.error(
+            "Trade log has an open BUY with a missing or invalid fill price; "
+            "refusing to restore an invalid position."
+        )
+        if not DRY_RUN:
+            untracked_holdings = True
+        return None
+
+    if open_entry is not None and open_amount > 0:
+        amount = open_amount
+        if not DRY_RUN:
+            balance = exchange.get_balance(base)
+            amount = min(open_amount, balance["free"])
+            if amount < open_amount:
+                logger.warning(
+                    f"Logged open amount {open_amount:.6f} {base} exceeds balance "
+                    f"{balance['free']:.6f}; tracking the balance only."
+                )
+            if amount <= 0.0001:
+                return None
+        position = {"entry_price": open_entry, "amount": amount, "side": "buy"}
+        logger.info(
+            f"Restored open position: {amount:.6f} {base} @ ${open_entry:,.2f} (from trade log)"
+        )
+        return position
+
+    if not DRY_RUN:
+        holdings = exchange.get_balance(base)["free"]
+        if holdings > 0.0001:
+            untracked_holdings = True
+            logger.warning(
+                f"Found {holdings:.6f} {base} with no logged open BUY. Leaving it "
+                "untraded and blocking new BUYs until it is reconciled."
+            )
+    return None
+
+
 def run():
     global position
 
@@ -137,11 +233,8 @@ def run():
     init_log()
     exchange = Exchange()
 
-    # Restore position from balance if bot restarted
-    btc_balance = exchange.get_balance("BTC")
-    if btc_balance["free"] > 0.0001:
-        logger.info(f"Found existing BTC balance: {btc_balance['free']:.6f}")
-        logger.info("Assuming open position. Will track from current price.")
+    # Restore state from the trade log if the bot restarted
+    restore_position(exchange)
 
     while running:
         try:
