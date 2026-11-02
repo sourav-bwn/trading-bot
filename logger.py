@@ -56,8 +56,14 @@ def get_performance():
     if not trades:
         return {"total_trades": 0, "total_pnl": 0.0, "win_rate": 0.0}
 
+    # Only closed trades (SELL rows) carry PnL. Open BUY rows are logged with
+    # pnl=0 and would inflate the trade count and dilute win rate / average.
+    closed = [t for t in trades if str(t.get("side", "")).upper() == "SELL"]
+    if not closed:
+        return {"total_trades": 0, "total_pnl": 0.0, "win_rate": 0.0}
+
     # Tolerate older logs written with thousands separators.
-    pnls = [float(str(t["pnl"]).replace(",", "")) for t in trades]
+    pnls = [float(str(t["pnl"]).replace(",", "")) for t in closed]
     wins = [p for p in pnls if p > 0]
     return {
         "total_trades": len(pnls),
