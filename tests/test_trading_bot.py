@@ -5,7 +5,9 @@ inside backtest.py's __main__ block, and the tests feed synthetic candles.
 """
 import csv
 import os
+import sys
 import tempfile
+import types
 import unittest
 
 import numpy as np
@@ -142,6 +144,173 @@ class TestTradeLog(unittest.TestCase):
                 ["2026-10-18T09:00:00", "BTC/USDT", "SELL", "0.01000000", "67,500.50", "675.00", "1,500.25", "10,000.00"]
             )
         self.assertAlmostEqual(logmod.get_performance()["total_pnl"], 1500.25)
+
+
+class TestPerformanceStats(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old = logmod.LOG_FILE
+        logmod.LOG_FILE = os.path.join(self.tmp, "trades.csv")
+
+    def tearDown(self):
+        logmod.LOG_FILE = self.old
+
+    def test_open_buy_rows_do_not_dilute_stats(self):
+        logmod.log_trade("BTC/USDT", "BUY", 0.01, 67000.0, 670.0, pnl=0.0, balance_usdt=9330.0)
+        logmod.log_trade("BTC/USDT", "SELL", 0.01, 69000.0, 690.0, pnl=20.0, balance_usdt=9350.0)
+        perf = logmod.get_performance()
+        self.assertEqual(perf["total_trades"], 1)
+        self.assertAlmostEqual(perf["total_pnl"], 20.0)
+        self.assertAlmostEqual(perf["win_rate"], 100.0)
+
+    def test_only_buys_logged_yields_zero_stats(self):
+        logmod.log_trade("BTC/USDT", "BUY", 0.01, 67000.0, 670.0, pnl=0.0, balance_usdt=9330.0)
+        perf = logmod.get_performance()
+        self.assertEqual(perf["total_trades"], 0)
+        self.assertEqual(perf["total_pnl"], 0.0)
+
+
+class TestRestorePosition(unittest.TestCase):
+    """bot.py imports ccxt via exchange.py; stub that module so tests stay offline."""
+
+    def setUp(self):
+        self._fake = types.ModuleType("exchange")
+        self._fake.Exchange = object
+        self._saved = sys.modules.get("exchange")
+        sys.modules["exchange"] = self._fake
+        sys.modules.pop("bot", None)
+        import bot
+        self.bot = bot
+        self.tmp = tempfile.mkdtemp()
+        self.old_log = logmod.LOG_FILE
+        logmod.LOG_FILE = os.path.join(self.tmp, "trades.csv")
+
+    def tearDown(self):
+        self.bot.position = None
+        self.bot.untracked_holdings = False
+        logmod.LOG_FILE = self.old_log
+        sys.modules.pop("bot", None)
+        if self._saved is not None:
+            sys.modules["exchange"] = self._saved
+        else:
+            sys.modules.pop("exchange", None)
+
+    def test_dry_run_restores_from_log_without_consulting_exchange(self):
+        # Simulated rows are the paper position; exchange balance is unrelated.
+        logmod.log_trade("BTC/USDT", "BUY", 0.01, 65000.0, 650.0, pnl=0.0, balance_usdt=9350.0)
+
+        class FakeExchange:
+            def get_balance(self, currency):
+                raise AssertionError("dry-run restore must not read exchange holdings")
+
+            def get_price(self, symbol):
+                raise AssertionError("restore must not anchor on current market price")
+
+        self.bot.position = None
+        self.bot.DRY_RUN = True
+        pos = self.bot.restore_position(FakeExchange())
+        self.assertIsNotNone(pos)
+        self.assertEqual(pos["entry_price"], 65000.0)
+        self.assertEqual(pos["amount"], 0.01)
+
+    def test_live_restore_clamps_amount_to_exchange_balance(self):
+        logmod.log_trade("BTC/USDT", "BUY", 0.01, 65000.0, 650.0, pnl=0.0, balance_usdt=9350.0)
+
+        class FakeExchange:
+            def get_balance(self, currency):
+                return {"free": 0.007, "used": 0.0, "total": 0.007}
+
+            def get_price(self, symbol):
+                raise AssertionError("restore must not anchor on current market price")
+
+        self.bot.position = None
+        old_dry = self.bot.DRY_RUN
+        self.bot.DRY_RUN = False
+        try:
+            pos = self.bot.restore_position(FakeExchange())
+        finally:
+            self.bot.DRY_RUN = old_dry
+        self.assertEqual(pos["amount"], 0.007)
+        self.assertEqual(pos["entry_price"], 65000.0)
+
+    def test_unlogged_holdings_block_new_buys(self):
+        # A closed log plus real holdings: stay flat and refuse to stack a buy.
+        logmod.log_trade("BTC/USDT", "BUY", 0.01, 65000.0, 650.0, pnl=0.0, balance_usdt=9350.0)
+        logmod.log_trade("BTC/USDT", "SELL", 0.01, 66000.0, 660.0, pnl=10.0, balance_usdt=10010.0)
+
+        class FakeExchange:
+            def __init__(self):
+                self.orders = []
+
+            def get_balance(self, currency):
+                if currency == "BTC":
+                    return {"free": 0.005, "used": 0.0, "total": 0.005}
+                return {"free": 10000.0, "used": 0.0, "total": 10000.0}
+
+            def place_market_buy(self, symbol, amount_usdt):
+                self.orders.append((symbol, amount_usdt))
+                return {"id": "x", "price": 67000.0, "amount": 0.001, "cost": amount_usdt}
+
+        exchange = FakeExchange()
+        self.bot.position = None
+        self.bot.untracked_holdings = False
+        old_dry = self.bot.DRY_RUN
+        self.bot.DRY_RUN = False
+        try:
+            with self.assertLogs("bot", level="WARNING"):
+                self.assertIsNone(self.bot.restore_position(exchange))
+            self.assertIsNone(self.bot.position)
+            self.assertTrue(self.bot.untracked_holdings)
+            self.bot.execute_buy(exchange)
+            self.assertEqual(exchange.orders, [], "BUY must be blocked until holdings are reconciled")
+            self.assertIsNone(self.bot.position)
+        finally:
+            self.bot.DRY_RUN = old_dry
+            self.bot.untracked_holdings = False
+
+    def test_invalid_logged_fill_price_is_refused_not_guessed(self):
+        # A BUY row with a non-finite price must not become a position.
+        logmod.init_log()
+        with open(logmod.LOG_FILE, "a", newline="") as f:
+            csv.writer(f).writerow(
+                ["2026-11-02T09:00:00", "BTC/USDT", "BUY", "0.005", "nan", "325.00", "0.00", "9675.00"]
+            )
+
+        class FakeExchange:
+            def get_balance(self, currency):
+                return {"free": 0.005, "used": 0.0, "total": 0.005}
+
+            def get_price(self, symbol):
+                raise AssertionError("no price may be fetched to patch an invalid entry")
+
+        self.bot.position = None
+        old_dry = self.bot.DRY_RUN
+        self.bot.DRY_RUN = False
+        try:
+            self.assertIsNone(self.bot.restore_position(FakeExchange()))
+            self.assertIsNone(self.bot.position)
+            self.assertTrue(self.bot.untracked_holdings)
+        finally:
+            self.bot.DRY_RUN = old_dry
+            self.bot.untracked_holdings = False
+
+    def test_reconciled_log_clears_the_buy_block(self):
+        # Once the log matches the holdings, restore works and buys are allowed.
+        logmod.log_trade("BTC/USDT", "BUY", 0.005, 65000.0, 325.0, pnl=0.0, balance_usdt=9675.0)
+
+        class FakeExchange:
+            def get_balance(self, currency):
+                return {"free": 0.005, "used": 0.0, "total": 0.005}
+
+        self.bot.position = None
+        old_dry = self.bot.DRY_RUN
+        self.bot.DRY_RUN = False
+        try:
+            pos = self.bot.restore_position(FakeExchange())
+        finally:
+            self.bot.DRY_RUN = old_dry
+        self.assertIsNotNone(pos)
+        self.assertFalse(self.bot.untracked_holdings)
 
 
 if __name__ == "__main__":
